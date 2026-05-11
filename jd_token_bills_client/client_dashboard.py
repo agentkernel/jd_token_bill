@@ -1411,12 +1411,20 @@ INDEX_HTML = r"""<!doctype html>
           </div>
           <div class="login-status" id="loginStatusBox" hidden></div>`;
       } else {
+        // Combine the server reason and any recheck-timeout hint into one
+        // visible warning so the user always sees feedback after clicking
+        // "我已登录过，重新检查".
+        const noteText =
+          (_recheckHint || (reason && reason !== "session expired" && reason !== "未登录" ? reason : ""));
+        const noteHtml = noteText ? `<p class="login-note">${esc(noteText)}</p>` : "";
+        // Consume the one-shot hint so it doesn't stick around for unrelated
+        // future renders.
+        _recheckHint = "";
         body = `
           <div class="login-icon" aria-hidden="true">🔐</div>
           <h1>请登录 JoyAgent</h1>
           <p class="login-lead">登录后即可查看你所在企业的 token 用量明细。</p>
-          ${reason && reason !== "session expired" && reason !== "未登录"
-            ? `<p class="login-note">${esc(reason)}</p>` : ""}
+          ${noteHtml}
           <div class="login-actions">
             <button class="btn btn-primary big" id="startLogin">登录 JoyAgent</button>
             <button class="btn" id="recheckLogin">我已登录过，重新检查</button>
@@ -1442,17 +1450,73 @@ INDEX_HTML = r"""<!doctype html>
       });
     }
 
+    // Module-level flag the next renderLoginScreen reads to surface a one-shot
+    // warning when the user clicked "我已登录过" but no new login was found.
+    let _recheckHint = "";
+
     async function recheckAfterLogin() {
       const box = $("loginStatusBox");
+      const allBtns = document.querySelectorAll(".login-actions .btn");
+      allBtns.forEach(b => { b.disabled = true; });
       if (box) {
         box.hidden = false;
-        box.className = "login-status";
-        box.innerHTML = '<div class="login-status-line">正在重新检测登录态...</div>';
+        box.className = "login-status running";
+        box.innerHTML = `
+          <div class="login-status-title">正在重新检测登录态...</div>
+          <div class="login-status-hint" id="recheckHint">正在重启浏览器引擎并重新读取登录 cookie。</div>`;
       }
-      try {
-        await fetch("/api/restart-worker", { cache: "no-store" });
-      } catch (_) {}
-      setTimeout(initialize, 600);
+
+      // Step 1: drop the in-process Playwright context so it re-reads the
+      // freshly saved profile from disk. Server returns once the worker has
+      // acknowledged the sentinel; the actual context recreation continues
+      // in the background.
+      try { await fetch("/api/restart-worker", { cache: "no-store" }); } catch (_) {}
+
+      // Step 2: poll /api/userinfo every 1.5s. Successful detection -> hand
+      // off to initialize() which will render the dashboard. Otherwise show
+      // a clear timeout message instead of silently re-rendering the same
+      // login screen (which used to look like nothing happened).
+      const deadline = Date.now() + 30 * 1000;
+      let lastInfo = null;
+      while (Date.now() < deadline) {
+        try {
+          const u = await (await fetch("/api/userinfo", { cache: "no-store" })).json();
+          lastInfo = u;
+          if (u.logged_in) {
+            if (box) {
+              box.className = "login-status success";
+              box.querySelector(".login-status-title").textContent = "已检测到登录，正在加载数据...";
+              const hint = $("recheckHint");
+              if (hint) hint.textContent = "";
+            }
+            _recheckHint = "";
+            setTimeout(initialize, 400);
+            return;
+          }
+        } catch (_) {
+          // network blip or server still warming up; keep polling
+        }
+        const remaining = Math.max(0, Math.round((deadline - Date.now()) / 1000));
+        const hint = $("recheckHint");
+        if (hint) hint.textContent = `仍未检测到登录态，继续重试中（剩余 ${remaining}s）...`;
+        await new Promise(r => setTimeout(r, 1500));
+      }
+
+      // Timed out. Surface a clear message so the user understands the
+      // recheck actually ran. Set a hint that the next renderLoginScreen
+      // will display, then re-enable the buttons.
+      if (box) {
+        box.className = "login-status failed";
+        box.querySelector(".login-status-title").textContent = "未检测到新的登录态";
+        const hint = $("recheckHint");
+        if (hint) {
+          hint.textContent = (lastInfo && lastInfo.error)
+            ? `服务器返回：${lastInfo.error}。请确认 --login 已经成功完成，或直接点击「登录 JoyAgent」。`
+            : "请确认登录已完成；如果反复失败，可以再点一次「登录 JoyAgent」。";
+        }
+      }
+      _recheckHint = "未检测到新的登录态。请确认登录窗口里的扫码 / 输入流程已经完成。";
+      allBtns.forEach(b => { b.disabled = false; });
     }
 
     async function triggerLoginFlow(mode, target) {
