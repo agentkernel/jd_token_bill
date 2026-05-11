@@ -21,11 +21,13 @@ Run the dashboard:
 from __future__ import annotations
 
 import argparse
+import collections
 import hashlib
 import json
 import os
 import queue
 import shutil
+import subprocess
 import sys
 import threading
 import time
@@ -252,6 +254,119 @@ def restart_browser_worker(timeout: float = 30.0) -> tuple[bool, str]:
     if not holder["done"].wait(timeout=timeout):
         return False, "restart sentinel timed out"
     return True, "browser worker restarted; new request will re-read profile"
+
+
+# ---------------------------------------------------------------------------
+# Subprocess-driven login: the web UI's "登录 JoyAgent" button spawns a
+# `python client_dashboard.py --login` child so a real, headed browser can pop
+# up for the user. We capture the child's stdout so the page can show live
+# progress without making the user open another terminal.
+# ---------------------------------------------------------------------------
+
+_LOGIN_LOCK = threading.Lock()
+_LOGIN_PROC: subprocess.Popen | None = None
+_LOGIN_LOG: collections.deque[str] = collections.deque(maxlen=120)
+_LOGIN_MODE: str = ""  # "login" or "switch-tenant"
+
+
+def _login_reader(proc: subprocess.Popen) -> None:
+    try:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            _LOGIN_LOG.append(line.rstrip("\r\n"))
+    except Exception as exc:
+        _LOGIN_LOG.append(f"[reader error] {exc}")
+    finally:
+        try:
+            proc.stdout.close()  # type: ignore[union-attr]
+        except Exception:
+            pass
+
+
+def start_login_subprocess(mode: str, target: str | None = None) -> tuple[bool, str]:
+    """Launch `python client_dashboard.py --login` (or --switch-tenant) as a
+    child process and stream its output into _LOGIN_LOG. Only one login can
+    run at a time; calling again while a login is in flight is a no-op."""
+    global _LOGIN_PROC, _LOGIN_MODE
+    with _LOGIN_LOCK:
+        if _LOGIN_PROC is not None and _LOGIN_PROC.poll() is None:
+            return False, "another login is already running"
+        if mode not in ("login", "switch-tenant"):
+            return False, f"unknown login mode: {mode}"
+
+        _LOGIN_LOG.clear()
+        _LOGIN_MODE = mode
+        cmd = [sys.executable, str(Path(__file__).resolve())]
+        if mode == "login":
+            cmd.append("--login")
+            if target:
+                # --login forwards target_tenant via --switch-tenant value
+                cmd += ["--switch-tenant", target]
+        else:
+            cmd.append("--switch-tenant")
+            if target:
+                cmd.append(target)
+
+        creationflags = 0
+        if os.name == "nt":
+            # Hide the python console window of the child; Chromium's own
+            # window is still visible because it's a separate process.
+            creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+        # Make sure the child's stdout is line-buffered UTF-8 even when stdout
+        # is a pipe and the parent is on Windows (default cp936 mojibake).
+        env = dict(os.environ)
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+
+        try:
+            _LOGIN_PROC = subprocess.Popen(
+                cmd,
+                cwd=str(WORKSPACE_DIR),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                env=env,
+                creationflags=creationflags,
+            )
+        except Exception as exc:
+            return False, f"spawn failed: {exc}"
+
+        threading.Thread(
+            target=_login_reader, args=(_LOGIN_PROC,), daemon=True, name="login-reader"
+        ).start()
+        return True, f"login subprocess started (pid={_LOGIN_PROC.pid})"
+
+
+def login_subprocess_status() -> dict:
+    """Snapshot of the current/last login subprocess for the web UI."""
+    proc = _LOGIN_PROC
+    log = list(_LOGIN_LOG)
+    if proc is None:
+        return {"state": "idle", "mode": "", "exit_code": None, "log": log}
+    rc = proc.poll()
+    if rc is None:
+        return {"state": "running", "mode": _LOGIN_MODE, "pid": proc.pid, "exit_code": None, "log": log}
+    state = "succeeded" if rc == 0 else "failed"
+    return {"state": state, "mode": _LOGIN_MODE, "pid": proc.pid, "exit_code": rc, "log": log}
+
+
+def cancel_login_subprocess() -> tuple[bool, str]:
+    proc = _LOGIN_PROC
+    if proc is None or proc.poll() is not None:
+        return True, "no login running"
+    try:
+        proc.terminate()
+        try:
+            proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+        return True, f"terminated pid {proc.pid}"
+    except Exception as exc:
+        return False, f"terminate failed: {exc}"
 
 
 def reset_local_state(*, drop_profile: bool = True) -> list[str]:
@@ -799,6 +914,39 @@ class ClientHandler(BaseHTTPRequestHandler):
                 ok, msg = restart_browser_worker()
                 self.send_json({"ok": ok, "message": msg})
                 return
+            if path == "/api/login-status":
+                self.send_json(login_subprocess_status())
+                return
+            self.send_json({"error": "not found"}, status=404)
+        except _CLOSED:
+            self.close_connection = True
+        except Exception as exc:
+            try:
+                self.send_json({"error": str(exc)}, status=500)
+            except _CLOSED:
+                self.close_connection = True
+
+    def do_POST(self) -> None:
+        try:
+            parsed = urlparse(self.path)
+            path = parsed.path
+            if path in ("/api/login-start", "/api/login-cancel"):
+                length = int(self.headers.get("Content-Length") or 0)
+                raw = self.rfile.read(length) if length > 0 else b""
+                try:
+                    payload = json.loads(raw.decode("utf-8")) if raw else {}
+                except Exception:
+                    payload = {}
+                if path == "/api/login-start":
+                    mode = str(payload.get("mode") or "login")
+                    target = payload.get("target") or None
+                    ok, msg = start_login_subprocess(mode, target=target)
+                    self.send_json({"ok": ok, "message": msg, "status": login_subprocess_status()})
+                    return
+                if path == "/api/login-cancel":
+                    ok, msg = cancel_login_subprocess()
+                    self.send_json({"ok": ok, "message": msg})
+                    return
             self.send_json({"error": "not found"}, status=404)
         except _CLOSED:
             self.close_connection = True
@@ -981,41 +1129,65 @@ INDEX_HTML = r"""<!doctype html>
     .pager .muted { color: var(--muted); }
 
     .login-screen {
-      max-width: 580px; margin: 80px auto;
+      max-width: 480px; margin: 96px auto 40px;
       background: var(--card); border: 1px solid var(--line);
-      border-radius: 14px; padding: 28px 32px; text-align: center;
-      box-shadow: var(--shadow);
+      border-radius: 16px; padding: 36px 36px 28px; text-align: center;
+      box-shadow: 0 6px 30px rgba(15, 23, 42, 0.08);
     }
-    .login-screen h1 { font-size: 18px; margin: 0 0 10px; }
-    .login-screen p { color: var(--mid); font-size: 14px; line-height: 1.6; }
-    .login-screen code {
-      display: inline-block; margin-top: 6px;
-      background: #F1F5F9; padding: 6px 10px; border-radius: 6px;
-      color: #1E40AF; font-size: 12.5px;
-      font-family: SFMono-Regular, Menlo, Consolas, monospace;
-      word-break: break-all;
-    }
-    .login-steps {
-      counter-reset: step; list-style: none;
-      padding: 0; margin: 14px 0; text-align: left;
-    }
-    .login-steps li {
-      position: relative; padding: 10px 12px 10px 40px;
-      border: 1px solid var(--line); border-radius: 10px;
-      margin-bottom: 8px; background: #FAFBFC;
-      font-size: 13.5px; color: var(--text);
-    }
-    .login-steps li::before {
-      counter-increment: step; content: counter(step);
-      position: absolute; left: 10px; top: 11px;
-      width: 22px; height: 22px; border-radius: 999px;
-      background: var(--primary); color: #fff;
+    .login-icon {
+      width: 64px; height: 64px; border-radius: 50%;
+      background: var(--primary-tint);
+      color: var(--primary); font-size: 30px;
       display: inline-flex; align-items: center; justify-content: center;
-      font-size: 12px; font-weight: 600;
+      margin: 0 auto 16px;
     }
+    .login-screen h1 { font-size: 20px; margin: 0 0 8px; font-weight: 600; }
+    .login-screen p.login-lead { color: var(--mid); font-size: 14px; line-height: 1.6; margin: 0 0 4px; }
+    .login-screen p.login-note {
+      color: var(--warn); font-size: 13px; line-height: 1.5;
+      background: #FFFBEB; border: 1px solid #FDE68A;
+      border-radius: 8px; padding: 8px 12px; margin: 14px 0 0;
+    }
+    .login-screen p.login-hint {
+      color: var(--muted); font-size: 12px; line-height: 1.5;
+      margin: 14px 0 0;
+    }
+
+    .tenant-picker { margin: 18px 0 4px; text-align: left; }
+    .tenant-picker label {
+      display: block; font-size: 12px; color: var(--muted);
+      margin-bottom: 4px;
+    }
+    .tenant-picker select {
+      width: 100%; height: 38px; padding: 0 10px;
+      border: 1px solid var(--line-2); border-radius: 8px;
+      background: #fff; font: inherit; color: var(--text);
+    }
+
     .login-actions {
-      margin-top: 18px;
+      margin-top: 22px;
       display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;
+    }
+    .btn.big { height: 44px; padding: 0 22px; font-size: 14px; font-weight: 500; }
+
+    .login-status {
+      margin-top: 18px; padding: 14px;
+      border-radius: 10px; text-align: left;
+      border: 1px solid var(--line);
+      background: #FAFBFC;
+    }
+    .login-status.running { border-color: var(--primary); background: var(--primary-tint); }
+    .login-status.success { border-color: #34D399; background: #ECFDF5; }
+    .login-status.failed  { border-color: #F87171; background: #FEF2F2; }
+    .login-status-title { font-weight: 600; font-size: 13.5px; color: var(--text); }
+    .login-status-hint  { color: var(--mid); font-size: 12px; margin-top: 4px; line-height: 1.5; }
+    .login-status-line  { color: var(--mid); font-size: 13px; }
+    .login-log {
+      margin: 10px 0 0; padding: 10px 12px;
+      background: #0F172A; color: #CBD5E1; border-radius: 8px;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 11.5px; line-height: 1.55;
+      max-height: 180px; overflow: auto; white-space: pre-wrap;
     }
 
     .pill {
@@ -1202,62 +1374,151 @@ INDEX_HTML = r"""<!doctype html>
        ======================================================================== */
     function renderLoginScreen(reason, opts) {
       opts = opts || {};
-      $("topbarMeta").textContent = opts.tenantMissing ? "已登录 · 未进入企业空间" : "未登录";
       const tenants = opts.availableTenants || [];
+      const isTenantMissing = !!opts.tenantMissing;
+      $("topbarMeta").textContent = isTenantMissing ? "已登录 · 未进入企业空间" : "未登录";
+
       let body;
-      if (opts.tenantMissing) {
-        const list = tenants.length
-          ? '<ul style="text-align:left;margin:8px auto 0;display:inline-block">' +
-            tenants.map(t => `<li>${esc(t.name || t.jdAccount || ("id=" + t.id))}</li>`).join("") +
-            '</ul>'
-          : '<p>当前账号没有可用的企业空间。请联系管理员邀请你加入。</p>';
-        const cmd = tenants.length === 1
-          ? "python client_dashboard.py --switch-tenant"
-          : (tenants.length > 1
-              ? "python client_dashboard.py --switch-tenant \"" + (tenants[0].name || tenants[0].jdAccount || tenants[0].id) + "\""
-              : "python client_dashboard.py --switch-tenant \"<企业名称>\"");
+      if (isTenantMissing) {
+        const tenantOptions = tenants.length
+          ? '<select id="tenantPicker">' +
+            tenants.map(t => `<option value="${esc(t.name || t.jdAccount || t.id || "")}">${esc(t.name || t.jdAccount || ("id=" + t.id))}</option>`).join("") +
+            '</select>'
+          : '<p class="login-note">当前账号没有可用的企业空间。请联系管理员把你加入企业。</p>';
         body = `
-          <h1>账号已登录，但未进入企业空间</h1>
-          <p>${esc(reason || "JoyAgent 默认显示个人空间，需要切换到企业空间才能看到团队用量。")}</p>
-          <p>检测到 ${tenants.length} 个可用企业空间：</p>
-          ${list}
-          <p>在 PowerShell 中执行下面命令一键切换，完成后刷新本页：</p>
-          <code>${esc(cmd)}</code>
+          <div class="login-icon" aria-hidden="true">⚙</div>
+          <h1>切换到企业空间</h1>
+          <p class="login-lead">JoyAgent 默认进入个人空间，需要切换到企业空间才能看到团队的 token 用量。</p>
+          ${tenants.length ? `<div class="tenant-picker"><label>选择企业空间</label>${tenantOptions}</div>` : tenantOptions}
           <div class="login-actions">
-            <button class="btn btn-primary" id="recheckLogin">已切换，重新检查</button>
-            <button class="btn" id="restartWorker" title="清掉本进程缓存的浏览器会话，强制按最新登录态重新读取">刷新会话缓存</button>
-          </div>`;
+            ${tenants.length ? '<button class="btn btn-primary big" id="startSwitch">切换</button>' : ''}
+            <button class="btn" id="recheckLogin">我已切换，重新检查</button>
+          </div>
+          <div class="login-status" id="loginStatusBox" hidden></div>`;
       } else {
         body = `
-          <h1>请先登录 JoyAgent</h1>
-          <p>${esc(reason || "本地未检测到登录态，或登录已过期。")}</p>
-          <ol class="login-steps">
-            <li>另开一个 PowerShell，进入项目目录：
-              <code>cd ${esc(window.location.search.includes("from_admin") ? "jd_token_bills" : "jd_token_bills_client")}</code></li>
-            <li>第一次安装：
-              <code>pip install -r requirements.txt &amp;&amp; python -m playwright install chromium</code></li>
-            <li>登录 JoyAgent，登录成功窗口会自动关闭：
-              <code>python client_dashboard.py --login</code></li>
-            <li>回到本页，点下面的「已登录，重新检查」。</li>
-          </ol>
+          <div class="login-icon" aria-hidden="true">🔐</div>
+          <h1>请登录 JoyAgent</h1>
+          <p class="login-lead">登录后即可查看你所在企业的 token 用量明细。</p>
+          ${reason && reason !== "session expired" && reason !== "未登录"
+            ? `<p class="login-note">${esc(reason)}</p>` : ""}
           <div class="login-actions">
-            <button class="btn btn-primary" id="recheckLogin">已登录，重新检查</button>
-            <button class="btn" id="restartWorker" title="清掉本进程缓存的浏览器会话，强制按最新登录态重新读取">刷新会话缓存</button>
-          </div>`;
+            <button class="btn btn-primary big" id="startLogin">登录 JoyAgent</button>
+            <button class="btn" id="recheckLogin">我已登录过，重新检查</button>
+          </div>
+          <p class="login-hint">点击后会弹出 JoyAgent 登录窗口；扫码或输入账号密码完成登录后窗口会自动关闭，本页会自动加载数据。</p>
+          <div class="login-status" id="loginStatusBox" hidden></div>`;
       }
       $("mainWrap").innerHTML = `<div class="login-screen">${body}</div>`;
-      $("recheckLogin").addEventListener("click", initialize);
-      const rb = $("restartWorker");
-      if (rb) rb.addEventListener("click", async () => {
-        rb.disabled = true; rb.textContent = "正在清缓存...";
-        try {
-          const r = await fetch("/api/restart-worker", { cache: "no-store" });
-          await r.json();
-        } catch (_) {}
-        // Brief delay so the worker has time to finish its restart sentinel
-        // before the next probe; otherwise the user sees a transient timeout.
-        setTimeout(() => initialize(), 800);
+
+      $("recheckLogin").addEventListener("click", () => {
+        // recheck flow: drop in-memory worker session first so the freshly
+        // saved cookies (from a prior --login) take effect immediately.
+        recheckAfterLogin();
       });
+
+      const startBtn = $("startLogin");
+      if (startBtn) startBtn.addEventListener("click", () => triggerLoginFlow("login"));
+
+      const switchBtn = $("startSwitch");
+      if (switchBtn) switchBtn.addEventListener("click", () => {
+        const picked = ($("tenantPicker") || {}).value || "";
+        triggerLoginFlow("switch-tenant", picked);
+      });
+    }
+
+    async function recheckAfterLogin() {
+      const box = $("loginStatusBox");
+      if (box) {
+        box.hidden = false;
+        box.className = "login-status";
+        box.innerHTML = '<div class="login-status-line">正在重新检测登录态...</div>';
+      }
+      try {
+        await fetch("/api/restart-worker", { cache: "no-store" });
+      } catch (_) {}
+      setTimeout(initialize, 600);
+    }
+
+    async function triggerLoginFlow(mode, target) {
+      const box = $("loginStatusBox");
+      const allBtns = document.querySelectorAll(".login-actions .btn");
+      allBtns.forEach(b => { b.disabled = true; });
+      if (box) {
+        box.hidden = false;
+        box.className = "login-status running";
+        box.innerHTML = `
+          <div class="login-status-title">正在打开 JoyAgent 登录窗口...</div>
+          <div class="login-status-hint">请在弹出的浏览器窗口中完成登录；登录成功后窗口将自动关闭。</div>
+          <pre class="login-log" id="loginLog"></pre>`;
+      }
+      try {
+        const r = await fetch("/api/login-start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          cache: "no-store",
+          body: JSON.stringify({ mode: mode, target: target || null }),
+        });
+        const j = await r.json();
+        if (!j.ok) throw new Error(j.message || "无法启动登录");
+        await pollLoginStatus(mode);
+      } catch (err) {
+        if (box) {
+          box.className = "login-status failed";
+          box.innerHTML = `<div class="login-status-title">登录启动失败</div>
+            <div class="login-status-hint">${esc(err.message || String(err))}</div>`;
+        }
+        allBtns.forEach(b => { b.disabled = false; });
+      }
+    }
+
+    async function pollLoginStatus(mode) {
+      const box = $("loginStatusBox");
+      const logEl = () => $("loginLog");
+      const updateLog = (lines) => {
+        const el = logEl();
+        if (el) {
+          el.textContent = (lines || []).slice(-12).join("\n");
+          el.scrollTop = el.scrollHeight;
+        }
+      };
+      // Poll every 1.5s until the subprocess is no longer "running".
+      const deadline = Date.now() + 10 * 60 * 1000; // 10 minutes
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 1500));
+        let s;
+        try {
+          s = await (await fetch("/api/login-status", { cache: "no-store" })).json();
+        } catch (_) { continue; }
+        updateLog(s.log);
+        if (s.state === "running") continue;
+        if (s.state === "succeeded") {
+          if (box) {
+            box.className = "login-status success";
+            box.querySelector(".login-status-title").textContent =
+              mode === "switch-tenant" ? "切换成功，正在加载数据..." : "登录成功，正在加载数据...";
+          }
+          // Drop the in-process worker so it picks up the freshly saved
+          // cookies, then fall back to the normal initialization flow.
+          try { await fetch("/api/restart-worker", { cache: "no-store" }); } catch (_) {}
+          setTimeout(initialize, 800);
+          return;
+        }
+        if (box) {
+          box.className = "login-status failed";
+          box.querySelector(".login-status-title").textContent =
+            mode === "switch-tenant" ? "切换失败" : "登录失败或被取消";
+          box.insertAdjacentHTML("beforeend",
+            `<div class="login-status-hint">退出码 ${s.exit_code}。可以再次点击「${mode === "switch-tenant" ? "切换" : "登录 JoyAgent"}」重试。</div>`);
+        }
+        document.querySelectorAll(".login-actions .btn").forEach(b => { b.disabled = false; });
+        return;
+      }
+      if (box) {
+        box.className = "login-status failed";
+        box.querySelector(".login-status-title").textContent = "登录超时";
+      }
+      document.querySelectorAll(".login-actions .btn").forEach(b => { b.disabled = false; });
     }
 
     /* ========================================================================
