@@ -21,8 +21,11 @@ Run the dashboard:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import queue
+import shutil
 import sys
 import threading
 import time
@@ -51,6 +54,24 @@ WORKSPACE_DIR = Path(__file__).resolve().parent
 USER_DATA_DIR = WORKSPACE_DIR / "joyagent_profile"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8766
+
+# Cache-busting build tag derived from this file's mtime + a hash of its bytes.
+# Surfaced both in the HTML topbar (so the user can see at a glance whether the
+# browser is showing the latest version) and in HTTP ETag/Last-Modified headers
+# (so any intermediate cache returns a fresh copy).
+def _compute_build_tag() -> tuple[str, int]:
+    src = Path(__file__).resolve()
+    try:
+        mtime = int(src.stat().st_mtime)
+        digest = hashlib.sha1(src.read_bytes()).hexdigest()[:8]
+    except OSError:
+        mtime = int(time.time())
+        digest = "unknown"
+    stamp = datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return f"{stamp} #{digest}", mtime
+
+
+BUILD_TAG, BUILD_MTIME = _compute_build_tag()
 
 PROFILE_URL = "https://joyagent.jd.com/pl/profile?tab=usageStatistics"
 USERINFO_API = "https://agentrs.jd.com/api/saas/user/v2/userInfo"
@@ -138,6 +159,9 @@ def compute_cost(model: str, token_type: Any, tokens: int) -> tuple[float, float
 _BROWSER_QUEUE: "queue.Queue[tuple]" = queue.Queue()
 _BROWSER_THREAD: threading.Thread | None = None
 _BROWSER_LOCK = threading.Lock()
+# Sentinel job: when received by the worker loop it tears down its own
+# Playwright context cleanly so a fresh one can be created on the next request.
+_RESTART_SENTINEL = object()
 
 
 def _new_context(pw, headless: bool) -> BrowserContext:
@@ -153,22 +177,43 @@ def _new_context(pw, headless: bool) -> BrowserContext:
 def _browser_worker_loop() -> None:
     pw = sync_playwright().start()
     try:
-        context = _new_context(pw, headless=True)
-        page = context.new_page()
-        try:
-            page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
-        except Exception as exc:
-            print(f"  [client] initial goto warning: {exc}")
         while True:
-            job, holder = _BROWSER_QUEUE.get()
-            if job is None:
-                return
+            # (Re)create a fresh persistent context. Recreating happens after
+            # `_RESTART_SENTINEL` so freshly-saved login cookies (`--login`)
+            # are picked up without restarting the whole server.
+            context = _new_context(pw, headless=True)
+            page = context.new_page()
             try:
-                holder["result"] = job(page)
+                page.goto(PROFILE_URL, wait_until="domcontentloaded", timeout=60_000)
             except Exception as exc:
-                holder["error"] = exc
-            finally:
-                holder["done"].set()
+                print(f"  [client] initial goto warning: {exc}")
+
+            stop = False
+            restart = False
+            while not stop and not restart:
+                job, holder = _BROWSER_QUEUE.get()
+                if job is None:
+                    stop = True
+                    break
+                if job is _RESTART_SENTINEL:
+                    restart = True
+                    if holder is not None:
+                        holder["result"] = "restarted"
+                        holder["done"].set()
+                    break
+                try:
+                    holder["result"] = job(page)
+                except Exception as exc:
+                    holder["error"] = exc
+                finally:
+                    holder["done"].set()
+
+            try:
+                context.close()
+            except Exception:
+                pass
+            if stop:
+                return
     finally:
         try:
             pw.stop()
@@ -195,6 +240,39 @@ def with_remote_page(job, timeout: float = 120.0):
     if holder["error"] is not None:
         raise holder["error"]
     return holder["result"]
+
+
+def restart_browser_worker(timeout: float = 30.0) -> tuple[bool, str]:
+    """Drain the queue with a sentinel so the worker rebuilds its Playwright
+    context. Safe to call when no worker exists (becomes a no-op)."""
+    if _BROWSER_THREAD is None or not _BROWSER_THREAD.is_alive():
+        return True, "browser worker not running (will start fresh on next request)"
+    holder: dict = {"done": threading.Event(), "result": None, "error": None}
+    _BROWSER_QUEUE.put((_RESTART_SENTINEL, holder))
+    if not holder["done"].wait(timeout=timeout):
+        return False, "restart sentinel timed out"
+    return True, "browser worker restarted; new request will re-read profile"
+
+
+def reset_local_state(*, drop_profile: bool = True) -> list[str]:
+    """Wipe local-only state. Currently the customer dashboard has no SQLite
+    cache, only the persistent login profile. Stops the worker first so the
+    profile directory isn't held by a running browser process on Windows."""
+    notes: list[str] = []
+    try:
+        restart_browser_worker(timeout=10.0)
+        notes.append("stopped in-memory browser worker")
+    except Exception as exc:
+        notes.append(f"worker stop warning: {exc}")
+    if drop_profile and USER_DATA_DIR.exists():
+        try:
+            shutil.rmtree(USER_DATA_DIR, ignore_errors=False)
+            notes.append(f"deleted login profile: {USER_DATA_DIR}")
+        except OSError as exc:
+            notes.append(f"profile delete failed: {exc}")
+    else:
+        notes.append("no profile to delete")
+    return notes
 
 
 # ---------------------------------------------------------------------------
@@ -657,14 +735,22 @@ class ClientHandler(BaseHTTPRequestHandler):
         except _CLOSED:
             self.close_connection = True
 
-    def _send(self, status: int, ctype: str, body: bytes) -> None:
+    def _send(self, status: int, ctype: str, body: bytes, *, etag: str | None = None) -> None:
         try:
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
-            self.send_header("Cache-Control", "no-store")
+            # Triple-belt cache busting: no-store covers modern browsers, the
+            # legacy Pragma+Expires pair handles older proxies, and an ETag lets
+            # us return 304 only when the bytes literally have not changed.
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            if etag:
+                self.send_header("ETag", etag)
             self.end_headers()
-            self.wfile.write(body)
+            if self.command != "HEAD":
+                self.wfile.write(body)
         except _CLOSED:
             self.close_connection = True
 
@@ -673,7 +759,20 @@ class ClientHandler(BaseHTTPRequestHandler):
         self._send(status, "application/json; charset=utf-8", body)
 
     def send_html(self, html: str) -> None:
-        self._send(200, "text/html; charset=utf-8", html.encode("utf-8"))
+        # Inject the build tag at send time so the user can see a per-deploy
+        # cache-bust marker in the topbar without us editing the raw HTML
+        # template.
+        rendered = html.replace("__BUILD_TAG__", BUILD_TAG)
+        body = rendered.encode("utf-8")
+        # ETag derives from the actual bytes so the browser refetches whenever
+        # the python source file changes. We still set no-store so clients
+        # that ignore ETags still get fresh HTML.
+        etag = '"' + hashlib.sha1(body).hexdigest()[:16] + '"'
+        if_none_match = self.headers.get("If-None-Match")
+        if if_none_match == etag:
+            self._send(304, "text/html; charset=utf-8", b"", etag=etag)
+            return
+        self._send(200, "text/html; charset=utf-8", body, etag=etag)
 
     def do_GET(self) -> None:
         try:
@@ -691,6 +790,15 @@ class ClientHandler(BaseHTTPRequestHandler):
             if path == "/api/debug":
                 self.send_json(build_debug_payload())
                 return
+            if path == "/api/restart-worker":
+                # Customer-facing "clear in-process session cache" button:
+                # tears down the running headless Playwright context so the
+                # next request re-reads the saved profile from disk. Use this
+                # right after `--login` so the new cookies take effect without
+                # restarting the whole server.
+                ok, msg = restart_browser_worker()
+                self.send_json({"ok": ok, "message": msg})
+                return
             self.send_json({"error": "not found"}, status=404)
         except _CLOSED:
             self.close_connection = True
@@ -699,6 +807,8 @@ class ClientHandler(BaseHTTPRequestHandler):
                 self.send_json({"error": str(exc)}, status=500)
             except _CLOSED:
                 self.close_connection = True
+
+    do_HEAD = do_GET
 
 
 # ---------------------------------------------------------------------------
@@ -751,7 +861,13 @@ INDEX_HTML = r"""<!doctype html>
       align-items: center;
       justify-content: space-between;
     }
-    .brand { font-weight: 700; letter-spacing: -0.02em; font-size: 18px; }
+    .brand { font-weight: 700; letter-spacing: -0.02em; font-size: 18px; display: flex; align-items: baseline; gap: 10px; }
+    .build-tag {
+      font-size: 11px; font-weight: 400; letter-spacing: 0;
+      color: var(--muted); background: #F1F5F9;
+      padding: 2px 8px; border-radius: 999px;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+    }
     .topbar-meta { color: var(--muted); font-size: 13px; display: flex; gap: 12px; align-items: center; }
     .topbar-meta strong { color: var(--text); font-weight: 600; }
 
@@ -865,17 +981,41 @@ INDEX_HTML = r"""<!doctype html>
     .pager .muted { color: var(--muted); }
 
     .login-screen {
-      max-width: 520px; margin: 80px auto;
+      max-width: 580px; margin: 80px auto;
       background: var(--card); border: 1px solid var(--line);
-      border-radius: 14px; padding: 28px; text-align: center;
+      border-radius: 14px; padding: 28px 32px; text-align: center;
       box-shadow: var(--shadow);
     }
     .login-screen h1 { font-size: 18px; margin: 0 0 10px; }
-    .login-screen p { color: var(--mid); font-size: 14px; }
+    .login-screen p { color: var(--mid); font-size: 14px; line-height: 1.6; }
     .login-screen code {
-      display: inline-block; margin-top: 14px;
-      background: #F1F5F9; padding: 8px 12px; border-radius: 8px;
-      color: #1E40AF; font-size: 13px;
+      display: inline-block; margin-top: 6px;
+      background: #F1F5F9; padding: 6px 10px; border-radius: 6px;
+      color: #1E40AF; font-size: 12.5px;
+      font-family: SFMono-Regular, Menlo, Consolas, monospace;
+      word-break: break-all;
+    }
+    .login-steps {
+      counter-reset: step; list-style: none;
+      padding: 0; margin: 14px 0; text-align: left;
+    }
+    .login-steps li {
+      position: relative; padding: 10px 12px 10px 40px;
+      border: 1px solid var(--line); border-radius: 10px;
+      margin-bottom: 8px; background: #FAFBFC;
+      font-size: 13.5px; color: var(--text);
+    }
+    .login-steps li::before {
+      counter-increment: step; content: counter(step);
+      position: absolute; left: 10px; top: 11px;
+      width: 22px; height: 22px; border-radius: 999px;
+      background: var(--primary); color: #fff;
+      display: inline-flex; align-items: center; justify-content: center;
+      font-size: 12px; font-weight: 600;
+    }
+    .login-actions {
+      margin-top: 18px;
+      display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;
     }
 
     .pill {
@@ -1001,7 +1141,10 @@ INDEX_HTML = r"""<!doctype html>
 </head>
 <body>
   <header class="topbar">
-    <div class="brand">JoyAgent 用量明细</div>
+    <div class="brand">
+      JoyAgent 用量明细
+      <span class="build-tag" title="构建版本 / build version">build __BUILD_TAG__</span>
+    </div>
     <div class="topbar-meta" id="topbarMeta">加载中...</div>
   </header>
 
@@ -1080,17 +1223,41 @@ INDEX_HTML = r"""<!doctype html>
           ${list}
           <p>在 PowerShell 中执行下面命令一键切换，完成后刷新本页：</p>
           <code>${esc(cmd)}</code>
-          <p style="margin-top:18px"><button class="btn btn-primary" id="recheckLogin">已切换，重新检查</button></p>`;
+          <div class="login-actions">
+            <button class="btn btn-primary" id="recheckLogin">已切换，重新检查</button>
+            <button class="btn" id="restartWorker" title="清掉本进程缓存的浏览器会话，强制按最新登录态重新读取">刷新会话缓存</button>
+          </div>`;
       } else {
         body = `
           <h1>请先登录 JoyAgent</h1>
           <p>${esc(reason || "本地未检测到登录态，或登录已过期。")}</p>
-          <p>在 PowerShell 中执行下面命令完成登录后刷新本页：</p>
-          <code>python client_dashboard.py --login</code>
-          <p style="margin-top:18px"><button class="btn btn-primary" id="recheckLogin">已登录，重新检查</button></p>`;
+          <ol class="login-steps">
+            <li>另开一个 PowerShell，进入项目目录：
+              <code>cd ${esc(window.location.search.includes("from_admin") ? "jd_token_bills" : "jd_token_bills_client")}</code></li>
+            <li>第一次安装：
+              <code>pip install -r requirements.txt &amp;&amp; python -m playwright install chromium</code></li>
+            <li>登录 JoyAgent，登录成功窗口会自动关闭：
+              <code>python client_dashboard.py --login</code></li>
+            <li>回到本页，点下面的「已登录，重新检查」。</li>
+          </ol>
+          <div class="login-actions">
+            <button class="btn btn-primary" id="recheckLogin">已登录，重新检查</button>
+            <button class="btn" id="restartWorker" title="清掉本进程缓存的浏览器会话，强制按最新登录态重新读取">刷新会话缓存</button>
+          </div>`;
       }
       $("mainWrap").innerHTML = `<div class="login-screen">${body}</div>`;
       $("recheckLogin").addEventListener("click", initialize);
+      const rb = $("restartWorker");
+      if (rb) rb.addEventListener("click", async () => {
+        rb.disabled = true; rb.textContent = "正在清缓存...";
+        try {
+          const r = await fetch("/api/restart-worker", { cache: "no-store" });
+          await r.json();
+        } catch (_) {}
+        // Brief delay so the worker has time to finish its restart sentinel
+        // before the next probe; otherwise the user sees a transient timeout.
+        setTimeout(() => initialize(), 800);
+      });
     }
 
     /* ========================================================================
@@ -1687,12 +1854,21 @@ INDEX_HTML = r"""<!doctype html>
 def run_server(host: str, port: int, open_browser: bool) -> None:
     server = ThreadingHTTPServer((host, port), ClientHandler)
     url = f"http://{host}:{port}/"
-    print(f"Customer dashboard: {url}")
-    print(f"Profile dir: {USER_DATA_DIR}")
+    print("=" * 60)
+    print(f"Customer dashboard:  {url}")
+    print(f"Build:               {BUILD_TAG}")
+    print(f"Profile directory:   {USER_DATA_DIR}")
     if not USER_DATA_DIR.exists() or not any(USER_DATA_DIR.iterdir()):
-        print("(profile is empty - run `python client_dashboard.py --login` first)")
+        print()
+        print("WARNING: login profile is empty.")
+        print("First-time setup: run this in another shell, then refresh the page:")
+        print("    python client_dashboard.py --login")
+    print("=" * 60)
     if open_browser:
-        webbrowser.open(url)
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1720,7 +1896,20 @@ def main() -> None:
     parser.add_argument("--host", default=DEFAULT_HOST)
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
     parser.add_argument("--no-open", action="store_true", help="Don't auto-open the browser")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Wipe local cached state (login profile). Customer dashboard does NOT keep a billing DB; this only removes ./joyagent_profile.",
+    )
     args = parser.parse_args()
+
+    if args.reset:
+        print(f"Build: {BUILD_TAG}")
+        print(f"Resetting local state under: {WORKSPACE_DIR}")
+        for note in reset_local_state():
+            print(f"  - {note}")
+        print("Done. Run `python client_dashboard.py --login` to sign in again.")
+        return
 
     if args.login:
         login_only(target_tenant=(args.switch_tenant or None))
