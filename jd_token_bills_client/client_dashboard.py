@@ -164,6 +164,13 @@ _BROWSER_LOCK = threading.Lock()
 # Sentinel job: when received by the worker loop it tears down its own
 # Playwright context cleanly so a fresh one can be created on the next request.
 _RESTART_SENTINEL = object()
+# When clear, the worker MUST NOT hold a Playwright persistent context on the
+# user_data_dir. The login subprocess clears this while it owns the profile
+# (because two Chromium processes can't safely share the same user-data-dir)
+# and sets it back when the subprocess exits, so the worker resumes and reads
+# the freshly-written cookies.
+_PROFILE_AVAIL_EVENT = threading.Event()
+_PROFILE_AVAIL_EVENT.set()
 
 
 def _new_context(pw, headless: bool) -> BrowserContext:
@@ -180,6 +187,11 @@ def _browser_worker_loop() -> None:
     pw = sync_playwright().start()
     try:
         while True:
+            # Block until the profile dir is available. The login subprocess
+            # clears this event while it needs exclusive access to
+            # joyagent_profile/, then sets it back when it exits.
+            _PROFILE_AVAIL_EVENT.wait()
+
             # (Re)create a fresh persistent context. Recreating happens after
             # `_RESTART_SENTINEL` so freshly-saved login cookies (`--login`)
             # are picked up without restarting the whole server.
@@ -283,10 +295,31 @@ def _login_reader(proc: subprocess.Popen) -> None:
             pass
 
 
+def _login_waiter(proc: subprocess.Popen) -> None:
+    """Block on the login subprocess and re-grant the profile dir to the
+    in-process worker as soon as the child exits. Runs in a background thread
+    so the HTTP /api/login-start request returns immediately."""
+    try:
+        proc.wait()
+        _LOGIN_LOG.append(f"[login subprocess exited rc={proc.returncode}]")
+    except Exception as exc:
+        _LOGIN_LOG.append(f"[waiter error] {exc}")
+    finally:
+        # Always release the profile so the worker doesn't deadlock if the
+        # subprocess crashed before we could explicitly clean up.
+        _PROFILE_AVAIL_EVENT.set()
+
+
 def start_login_subprocess(mode: str, target: str | None = None) -> tuple[bool, str]:
     """Launch `python client_dashboard.py --login` (or --switch-tenant) as a
     child process and stream its output into _LOGIN_LOG. Only one login can
-    run at a time; calling again while a login is in flight is a no-op."""
+    run at a time; calling again while a login is in flight is a no-op.
+
+    The dashboard's in-process Playwright worker is paused for the duration
+    of the subprocess: two Chromium processes cannot safely share the same
+    user_data_dir, so we close ours, give the subprocess exclusive access,
+    and re-create the context after it exits (which then loads the freshly
+    saved cookies from disk)."""
     global _LOGIN_PROC, _LOGIN_MODE
     with _LOGIN_LOCK:
         if _LOGIN_PROC is not None and _LOGIN_PROC.poll() is None:
@@ -319,6 +352,21 @@ def start_login_subprocess(mode: str, target: str | None = None) -> tuple[bool, 
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUNBUFFERED"] = "1"
 
+        # 1) Reserve the profile dir so the worker won't recreate a context
+        #    after we tell it to close.
+        _PROFILE_AVAIL_EVENT.clear()
+        # 2) Ask the worker to close its current Playwright context (if any).
+        #    The sentinel returns once the worker has finished its current
+        #    job, but the actual context.close() is a few ms later.
+        try:
+            restart_browser_worker(timeout=15.0)
+        except Exception as exc:
+            _LOGIN_LOG.append(f"[worker pause warning] {exc}")
+        # 3) Give Chromium a moment to actually exit and release the
+        #    SingletonLock file in the user_data_dir before the child
+        #    process tries to acquire it.
+        time.sleep(2.0)
+
         try:
             _LOGIN_PROC = subprocess.Popen(
                 cmd,
@@ -333,10 +381,18 @@ def start_login_subprocess(mode: str, target: str | None = None) -> tuple[bool, 
                 creationflags=creationflags,
             )
         except Exception as exc:
+            # Spawn failed - release the profile or we'd permanently block
+            # the worker.
+            _PROFILE_AVAIL_EVENT.set()
             return False, f"spawn failed: {exc}"
 
         threading.Thread(
             target=_login_reader, args=(_LOGIN_PROC,), daemon=True, name="login-reader"
+        ).start()
+        # Watcher releases the profile lock when the subprocess exits so the
+        # worker can pick up the freshly saved cookies on its next iteration.
+        threading.Thread(
+            target=_login_waiter, args=(_LOGIN_PROC,), daemon=True, name="login-waiter"
         ).start()
         return True, f"login subprocess started (pid={_LOGIN_PROC.pid})"
 
@@ -345,18 +401,31 @@ def login_subprocess_status() -> dict:
     """Snapshot of the current/last login subprocess for the web UI."""
     proc = _LOGIN_PROC
     log = list(_LOGIN_LOG)
+    profile_held = not _PROFILE_AVAIL_EVENT.is_set()
     if proc is None:
-        return {"state": "idle", "mode": "", "exit_code": None, "log": log}
+        return {
+            "state": "idle", "mode": "", "exit_code": None,
+            "log": log, "profile_locked": profile_held,
+        }
     rc = proc.poll()
     if rc is None:
-        return {"state": "running", "mode": _LOGIN_MODE, "pid": proc.pid, "exit_code": None, "log": log}
+        return {
+            "state": "running", "mode": _LOGIN_MODE, "pid": proc.pid,
+            "exit_code": None, "log": log, "profile_locked": profile_held,
+        }
     state = "succeeded" if rc == 0 else "failed"
-    return {"state": state, "mode": _LOGIN_MODE, "pid": proc.pid, "exit_code": rc, "log": log}
+    return {
+        "state": state, "mode": _LOGIN_MODE, "pid": proc.pid,
+        "exit_code": rc, "log": log, "profile_locked": profile_held,
+    }
 
 
 def cancel_login_subprocess() -> tuple[bool, str]:
     proc = _LOGIN_PROC
     if proc is None or proc.poll() is not None:
+        # No subprocess - but make sure we don't leave the profile lock held
+        # because of an earlier failed start.
+        _PROFILE_AVAIL_EVENT.set()
         return True, "no login running"
     try:
         proc.terminate()
@@ -364,8 +433,13 @@ def cancel_login_subprocess() -> tuple[bool, str]:
             proc.wait(timeout=3)
         except subprocess.TimeoutExpired:
             proc.kill()
+        # _login_waiter will set the event when wait() returns; do it here as
+        # a belt-and-braces measure in case the watcher thread hasn't woken
+        # up yet.
+        _PROFILE_AVAIL_EVENT.set()
         return True, f"terminated pid {proc.pid}"
     except Exception as exc:
+        _PROFILE_AVAIL_EVENT.set()
         return False, f"terminate failed: {exc}"
 
 
@@ -1551,6 +1625,20 @@ INDEX_HTML = r"""<!doctype html>
       }
     }
 
+    async function waitForProfileUnlock(maxMs = 6000) {
+      // Poll /api/login-status until the server reports profile_locked=false
+      // (i.e. the in-process worker has reclaimed the user_data_dir). Caps
+      // out so we never hang the page if the watcher thread misfires.
+      const deadline = Date.now() + maxMs;
+      while (Date.now() < deadline) {
+        try {
+          const s = await (await fetch("/api/login-status", { cache: "no-store" })).json();
+          if (!s.profile_locked) return;
+        } catch (_) { /* keep waiting */ }
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
     async function pollLoginStatus(mode) {
       const box = $("loginStatusBox");
       const logEl = () => $("loginLog");
@@ -1577,10 +1665,11 @@ INDEX_HTML = r"""<!doctype html>
             box.querySelector(".login-status-title").textContent =
               mode === "switch-tenant" ? "切换成功，正在加载数据..." : "登录成功，正在加载数据...";
           }
-          // Drop the in-process worker so it picks up the freshly saved
-          // cookies, then fall back to the normal initialization flow.
-          try { await fetch("/api/restart-worker", { cache: "no-store" }); } catch (_) {}
-          setTimeout(initialize, 800);
+          // Wait for the profile lock to be released by the subprocess
+          // watcher thread; otherwise the very next /api/userinfo would race
+          // the worker's context recreation and report "session expired".
+          await waitForProfileUnlock();
+          setTimeout(initialize, 400);
           return;
         }
         if (box) {
