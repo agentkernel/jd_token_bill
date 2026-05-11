@@ -1,0 +1,25 @@
+# Playwright / browser profiles (local login state)
+**/joyagent_profile/
+
+# Local databases and caches
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Logs and temp
+*.log
+_server_stderr.log
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
