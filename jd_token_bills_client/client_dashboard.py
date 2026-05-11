@@ -1168,7 +1168,22 @@ INDEX_HTML = r"""<!doctype html>
       margin-top: 22px;
       display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;
     }
+    /* Inside the login card every button shares the same height/padding so
+       primary and secondary actions read as a balanced pair, regardless of
+       whether the markup tagged them as `.big`. */
+    .login-actions .btn {
+      height: 44px;
+      padding: 0 22px;
+      font-size: 14px;
+      font-weight: 500;
+      min-width: 168px;
+      justify-content: center;
+    }
     .btn.big { height: 44px; padding: 0 22px; font-size: 14px; font-weight: 500; }
+    @media (max-width: 480px) {
+      .login-actions { flex-direction: column; align-items: stretch; }
+      .login-actions .btn { width: 100%; min-width: 0; }
+    }
 
     .login-status {
       margin-top: 18px; padding: 14px;
